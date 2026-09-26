@@ -66,6 +66,7 @@ export class PiChatApp extends LitElement {
   @state() private configModel = "";
   @state() private configBusy = false;
   @state() private configError = "";
+  @state() private providerAuthEvent?: import("../types.js").ProviderAuthEvent;
   @state() private websearch: import("../types.js").WebsearchStatus = { enabled: false, provider: "perplexity", providers: [] };
   @state() private wsBusy = false;
   @state() private wsError = "";
@@ -177,9 +178,10 @@ export class PiChatApp extends LitElement {
         this.configModel = ev.data.model ?? this.configModel;
         break;
       case "providers": this.providers = ev.data; break;
+      case "provider_auth_event": this.providerAuthEvent = ev.data; break;
       case "config_result":
         this.configBusy = false;
-        if (ev.data.ok) { this.configOpen = false; this.configError = ""; }
+        if (ev.data.ok) { this.configOpen = false; this.configError = ""; this.providerAuthEvent = undefined; }
         else this.configError = ev.data.error || "error";
         break;
       case "websearch_status": this.websearch = ev.data; break;
@@ -461,11 +463,15 @@ export class PiChatApp extends LitElement {
         .initialModel=${this.configModel}
         .busy=${this.configBusy}
         .error=${this.configError}
+        .authEvent=${this.providerAuthEvent}
         .websearch=${this.websearch}
         .wsBusy=${this.wsBusy}
         .wsError=${this.wsError}
         @request-providers=${() => this.wsSend({ type: "list_providers" })}
         @save-config=${(e: CustomEvent) => { this.configBusy = true; this.configError = ""; this.wsSend({ type: "save_config", ...e.detail }); }}
+        @save-custom-config=${(e: CustomEvent) => { this.configBusy = true; this.configError = ""; this.wsSend({ type: "save_custom_config", ...e.detail }); }}
+        @login-provider=${(e: CustomEvent) => { this.configBusy = true; this.configError = ""; this.providerAuthEvent = undefined; this.wsSend({ type: "login_provider", ...e.detail }); }}
+        @clear-auth=${() => { this.providerAuthEvent = undefined; }}
         @save-websearch=${(e: CustomEvent) => { this.wsBusy = true; this.wsError = ""; this.wsSend({ type: "save_websearch", ...e.detail }); }}
         @disable-websearch=${() => { this.wsBusy = true; this.wsError = ""; this.wsSend({ type: "disable_websearch" }); }}
         @setup-close=${() => { this.configOpen = false; this.configError = ""; }}

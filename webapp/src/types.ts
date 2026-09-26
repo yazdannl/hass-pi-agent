@@ -62,6 +62,7 @@ export type ServerEvent =
   | { type: "agent_end" }
   | { type: "config_status"; data: { configured: boolean; provider?: string; model?: string } }
   | { type: "providers"; data: ProviderInfo[] }
+  | { type: "provider_auth_event"; data: ProviderAuthEvent }
   | { type: "config_result"; data: { ok: boolean; error?: string } }
   | { type: "websearch_status"; data: WebsearchStatus }
   | { type: "websearch_result"; data: { ok: boolean; error?: string } }
@@ -71,7 +72,11 @@ export type ServerEvent =
 export interface WebsearchStatus { enabled: boolean; provider: string; providers: string[]; }
 
 /** AI provider + its selectable models (in-app setup). */
-export interface ProviderInfo { id: string; name: string; models: Array<{ id: string; name: string }>; }
+export interface ProviderInfo { id: string; name: string; models: Array<{ id: string; name: string }>; baseUrl?: string; modelId?: string; authConfigured?: boolean; }
+export type ProviderAuthEvent =
+  | { type: "device_code"; userCode: string; verificationUri: string; expiresInSeconds?: number }
+  | { type: "auth_url"; url: string }
+  | { type: "progress" | "info" };
 
 /** Client → server commands (mock). */
 export type ClientCommand =
@@ -82,6 +87,8 @@ export type ClientCommand =
   | { type: "open_session"; path: string }
   | { type: "list_providers" }
   | { type: "save_config"; provider: string; model: string; apiKey: string }
+  | { type: "save_custom_config"; baseUrl: string; modelId: string; apiKey: string }
+  | { type: "login_provider"; provider: string; model: string }
   | { type: "save_websearch"; provider: string; apiKey: string }
   | { type: "disable_websearch" };
 

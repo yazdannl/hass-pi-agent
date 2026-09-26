@@ -6,20 +6,20 @@ An AI agent with full access to your Home Assistant — manage automations, enti
 
 1. Install the add-on and click **Start**.
 2. Open **Pi Agent** from the sidebar (or **Open Web UI** on the add-on's Info tab).
-3. On first run a **welcome screen** asks you to choose an **AI provider** and **model** and paste that provider's **API key**. Pi runs a quick live test — you can only continue once the key actually works.
+3. On first run a **welcome screen** asks you to choose an **AI provider** and **model**. Depending on the provider, enter an API key, complete GitHub Copilot's browser device sign-in, or configure a custom OpenAI-compatible endpoint. Pi tests the connection before saving.
 4. That's it — start chatting.
 
 To change the provider, model, or key later, open the **⚙️ settings** button in the top bar of the chat panel.
 
-Everything is configured inside the panel. There are no API-key fields to fill in on this Configuration tab — your choice is saved to the add-on's options (so it survives restarts and updates) under the collapsed **AI provider & model** section. Leave that section alone unless you deliberately need a manual fallback (see the warning inside it: manual edits are **not** validated and only take effect on the next restart).
+Everything is configured inside the panel. There are no API-key fields to fill in on this Configuration tab. Built-in provider selections and API keys are saved in the add-on's options; GitHub Copilot OAuth credentials and custom endpoint settings (including its optional API key) are persisted in Pi's private engine directory. Setup survives restarts and updates.
 
 ## Choosing a provider
 
-The setup offers the providers that authenticate with a single **API key**:
+The setup offers API-key providers including:
 
-Anthropic · OpenAI · Google (Gemini) · OpenRouter · xAI (Grok) · Groq · Mistral · Cerebras · Hugging Face
+Anthropic · OpenAI · Google (Gemini) · OpenRouter · xAI (Grok) · Groq · Mistral · Cerebras · Hugging Face · OpenCode Zen · OpenCode Go
 
-Pick the provider, then the model (the list is fetched live from pi, e.g. `anthropic/claude-sonnet-4.5`), paste the key, and press **Save & test**.
+Pick the provider and a model from Pi's catalog, enter the provider's key, and press **Save & test**. GitHub Copilot uses Pi's native OAuth device sign-in instead of an API key. You can also choose **Custom OpenAI-compatible endpoint** and provide a base URL, model ID, and optional API key; Pi uses its native `models.json` support and live-tests the endpoint before saving.
 
 Where to get a key:
 
@@ -35,7 +35,7 @@ Where to get a key:
 | Cerebras | [cloud.cerebras.ai](https://cloud.cerebras.ai/) → API Keys |
 | Hugging Face | [huggingface.co](https://huggingface.co/) → Settings → Access Tokens |
 
-Providers that use OAuth (GitHub Copilot) or several credentials (Amazon Bedrock, Google Vertex, Azure OpenAI) are intentionally not offered — the setup is single-API-key only.
+Other Pi providers that require several credentials (such as Amazon Bedrock, Google Vertex, or Azure OpenAI) are not included in this focused setup flow.
 
 ## The chat panel
 
