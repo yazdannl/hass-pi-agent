@@ -12,7 +12,7 @@
  * Local dev config comes from the repo .env (HA_URL/HA_TOKEN/HA_CONFIG_PATH).
  */
 import { createServer } from "node:http";
-import { readFile, stat } from "node:fs/promises";
+import { readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { readFileSync, mkdirSync } from "node:fs";
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -86,10 +86,14 @@ await loader.reload();
 // them back on save via the Supervisor API. The API key applies to the live
 // runtime via setRuntimeApiKey (in-memory) — re-applied on every boot from the
 // stored option. Env (PI_DEFAULT_*/ambient key vars) is a local-dev fallback.
-const API_KEY_PROVIDERS = ["anthropic", "openai", "google", "openrouter", "xai", "groq", "mistral", "cerebras", "huggingface"];
+const API_KEY_PROVIDERS = ["anthropic", "openai", "google", "openrouter", "xai", "groq", "mistral", "cerebras", "huggingface", "opencode", "opencode-go"];
+const OAUTH_PROVIDERS = ["github-copilot"];
+const CUSTOM_PROVIDER = "custom-openai-compatible";
+const NO_AUTH_PLACEHOLDER = "pi-agent-no-auth"; // Pi docs use a dummy apiKey for keyless compatible endpoints.
 const PROVIDER_LABELS: Record<string, string> = {
   anthropic: "Anthropic", openai: "OpenAI", google: "Google (Gemini)", openrouter: "OpenRouter",
   xai: "xAI (Grok)", groq: "Groq", mistral: "Mistral", cerebras: "Cerebras", huggingface: "Hugging Face",
+  "github-copilot": "GitHub Copilot", opencode: "OpenCode Zen", "opencode-go": "OpenCode Go",
 };
 const SUPERVISOR = "http://supervisor";
 const supervisorToken = (): string | undefined => process.env.SUPERVISOR_TOKEN || process.env.HA_TOKEN;
@@ -123,6 +127,54 @@ async function readAi(): Promise<{ provider?: string; model?: string; api_key?: 
   return ai && typeof ai === "object" ? (ai as { provider?: string; model?: string; api_key?: string }) : {};
 }
 
+// Validation uses an isolated in-memory credential store so a failed test never
+// overwrites a saved provider key in auth.json.
+type MemoryCredentialStore = NonNullable<NonNullable<Parameters<typeof ModelRuntime.create>[0]>["credentials"]>;
+function memoryCredentialStore(): MemoryCredentialStore {
+  const entries = new Map<string, Awaited<ReturnType<MemoryCredentialStore["read"]>>>();
+  return {
+    async read(id) { return entries.get(id); },
+    async list() { return [...entries].flatMap(([providerId, credential]) => credential ? [{ providerId, type: credential.type }] : []); },
+    async modify(id, update) {
+      const next = await update(entries.get(id));
+      if (next) entries.set(id, next);
+      return entries.get(id);
+    },
+    async delete(id) { entries.delete(id); },
+  };
+}
+
+interface ModelsJsonState { raw?: string; config: Record<string, unknown>; providers: Record<string, any>; }
+async function readModelsJson(): Promise<ModelsJsonState> {
+  let raw: string | undefined;
+  try { raw = await readFile(resolve(engineAgentDir, "models.json"), "utf8"); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
+  let config: Record<string, unknown> = {};
+  if (raw !== undefined) {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid models config");
+    config = parsed as Record<string, unknown>;
+  }
+  const value = config.providers ?? {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid providers config");
+  return { raw, config, providers: value as Record<string, any> };
+}
+async function writePrivateFile(path: string, contents: string): Promise<void> {
+  const tmp = `${path}.${process.pid}.tmp`;
+  try {
+    await writeFile(tmp, contents, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    await rename(tmp, path);
+  } catch (e) {
+    await unlink(tmp).catch(() => {});
+    throw e;
+  }
+}
+async function restoreModelsJson(state: ModelsJsonState): Promise<void> {
+  const path = resolve(engineAgentDir, "models.json");
+  if (state.raw === undefined) await unlink(path).catch(() => {});
+  else await writePrivateFile(path, state.raw);
+}
+
 // Web search config lives under the `websearch` option (app-managed, like `ai`).
 // The in-app setup writes it; init-pi maps it to WEBSEARCH_* env at boot; the
 // extension registers the web_search tool from that env at loader.reload().
@@ -137,14 +189,15 @@ let wsProvider = "perplexity";
 
 let curProvider = "";
 let curModel = "";
-let model;
+type RuntimeModel = NonNullable<ReturnType<typeof resolveCliModel>["model"]>;
+let model: RuntimeModel | undefined;
 {
   const ai = await readAi();
   curProvider = ai.provider || process.env.PI_DEFAULT_PROVIDER || "";
   curModel = ai.model || process.env.PI_DEFAULT_MODEL || "";
   if (curProvider && ai.api_key) {
     try { await modelRuntime.setRuntimeApiKey(curProvider, ai.api_key); }
-    catch (e) { console.error("[engine] apply stored key:", (e as Error).message); }
+    catch { console.warn("[engine] stored provider credential could not be applied"); }
   }
   const spec = curProvider && curModel ? `${curProvider}/${curModel}` : (process.env.PI_DEFAULT_MODEL ?? "");
   if (spec) {
@@ -253,8 +306,8 @@ async function handlePrompt(u: UserSession, text: string): Promise<void> {
   u.lastActivity = Date.now();
   try {
     await u.session.prompt(text);
-  } catch (err) {
-    broadcastTo(u, { type: "text_delta", delta: `\n[engine error: ${(err as Error).message}]` });
+  } catch {
+    broadcastTo(u, { type: "text_delta", delta: "\n[The request failed. Check the provider configuration and try again.]" });
     broadcastTo(u, { type: "agent_end" });
   } finally {
     u.busy = false;
@@ -335,8 +388,8 @@ async function handleAsk(question: string, overrides: { provider?: string; model
   const timer = setTimeout(() => { void askSession.abort().catch(() => {}); }, ASK_TIMEOUT_MS);
   try {
     await askSession.prompt(question);
-  } catch (err) {
-    if (!answer) answer = `(error: ${(err as Error).message})`;
+  } catch {
+    if (!answer) answer = "The request failed. Check the provider configuration and try again.";
   } finally {
     clearTimeout(timer);
     unsub();
@@ -393,7 +446,7 @@ function relTime(iso?: string): string {
 }
 
 async function listSessions(userId: string): Promise<Array<{ path: string; id: string; title: string; when: string; count: number }>> {
-  const list = (await SessionManager.list(agentCwd, userDir(userId))) as Array<Record<string, unknown>>;
+  const list = (await SessionManager.list(agentCwd, userDir(userId))) as unknown as Array<Record<string, unknown>>;
   return list
     .map((s) => ({
       path: String(s.path ?? ""),
@@ -456,22 +509,30 @@ if (model) {
   console.log("[engine] ready — awaiting in-app provider/model/key setup");
 }
 
-// ── In-app config API (issue #RPRNX) ────────────────────────
-// Lists api-key providers+models, validates a provider/model/key combo with a
-// tiny live completion, and saves (persist key→auth.json + model→selection.json,
-// then apply live by rebuilding the active session). The webapp welcome/COG UI
-// drives these; the Supervisor add-on config no longer holds credentials.
-async function listApiKeyProviders(): Promise<Array<{ id: string; name: string; models: Array<{ id: string; name: string }> }>> {
-  // Refresh dynamic catalogs (e.g. OpenRouter) best-effort; static ones already present.
-  try { await Promise.race([modelRuntime.refresh({ allowNetwork: true }), new Promise((r) => setTimeout(r, 15000))]); } catch { /* offline / partial — use static */ }
-  const out: Array<{ id: string; name: string; models: Array<{ id: string; name: string }> }> = [];
-  for (const id of API_KEY_PROVIDERS) {
+// ── In-app provider setup ───────────────────────────────────
+// Provider IDs, models, authentication and compatible-endpoint requests all come
+// from the pinned Pi ModelRuntime. API-key validation uses memory-only credentials.
+async function listApiKeyProviders(): Promise<Array<{ id: string; name: string; models: Array<{ id: string; name: string }>; baseUrl?: string; modelId?: string; authConfigured?: boolean }>> {
+  try { await Promise.race([modelRuntime.refresh({ allowNetwork: true }), new Promise((r) => setTimeout(r, 15000))]); } catch { /* static catalogs remain available */ }
+  const out: Array<{ id: string; name: string; models: Array<{ id: string; name: string }>; baseUrl?: string; modelId?: string; authConfigured?: boolean }> = [];
+  for (const id of [...API_KEY_PROVIDERS, ...OAUTH_PROVIDERS]) {
     if (!modelRuntime.getProvider(id)) continue;
     let models: Array<{ id: string; name: string }> = [];
     try { models = modelRuntime.getModels(id).map((m) => ({ id: m.id, name: (m as { name?: string }).name ?? m.id })); } catch { models = []; }
-    if (!models.length) continue;
-    out.push({ id, name: PROVIDER_LABELS[id] ?? id, models });
+    if (models.length) {
+      let authConfigured = false;
+      try { authConfigured = modelRuntime.getProviderAuthStatus(id).configured; } catch { /* shown as not connected */ }
+      out.push({ id, name: PROVIDER_LABELS[id] ?? id, models, ...(id === "github-copilot" ? { authConfigured } : {}) });
+    }
   }
+  let custom: { baseUrl?: string; modelId?: string } = {};
+  try {
+    const config = (await readModelsJson()).providers[CUSTOM_PROVIDER];
+    if (typeof config?.baseUrl === "string" && typeof config?.models?.[0]?.id === "string") {
+      custom = { baseUrl: config.baseUrl, modelId: config.models[0].id };
+    }
+  } catch { /* omit malformed saved custom endpoint details */ }
+  out.push({ id: CUSTOM_PROVIDER, name: "Custom OpenAI-compatible endpoint", models: [], ...custom });
   return out;
 }
 
@@ -481,57 +542,177 @@ function configStatus(): { configured: boolean; provider?: string; model?: strin
   return { configured: !!model && authed, provider: curProvider, model: curModel };
 }
 
-// Re-apply the last-saved key for a provider (or clear it) so a FAILED validation
-// never leaves the live runtime holding a bad key that breaks the active session.
-async function restoreProviderKey(provider: string): Promise<void> {
+type LiveModel = { stopReason?: string; content?: Array<{ type: string; text?: string }> };
+async function testLiveModel(runtime: ModelRuntime, selectedModel: NonNullable<ReturnType<typeof resolveCliModel>["model"]>): Promise<boolean> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const ai = await readAi();
-    if (ai.provider === provider && ai.api_key) await modelRuntime.setRuntimeApiKey(provider, ai.api_key);
-    else await modelRuntime.removeRuntimeApiKey(provider);
-  } catch { /* best-effort restore */ }
+    const completion = runtime.completeSimple(selectedModel, { messages: [{ role: "user", content: [{ type: "text", text: "Reply with the single word OK." }], timestamp: Date.now() }] }, { maxTokens: 8, signal: controller.signal });
+    const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("timeout")), 30000); });
+    const msg = await Promise.race([completion, timeout]) as LiveModel;
+    return msg?.stopReason !== "error" && !!(msg?.content ?? []).some((c) => c.type === "text" && (c.text ?? "").trim());
+  } catch { controller.abort(); return false; }
+  finally { if (timer) clearTimeout(timer); }
+}
+
+async function testInIsolatedRuntime(provider: string, modelId: string, apiKey: string, custom?: Record<string, unknown>): Promise<boolean> {
+  let runtime: ModelRuntime | undefined;
+  try {
+    runtime = await ModelRuntime.create({ credentials: memoryCredentialStore(), modelsPath: resolve(engineAgentDir, "models.json"), refreshOnCreate: false, allowModelNetwork: false });
+    if (custom) runtime.registerProvider(provider, custom as Parameters<ModelRuntime["registerProvider"]>[1]);
+    else if (apiKey) await runtime.setRuntimeApiKey(provider, apiKey);
+    const resolved = resolveCliModel({ cliModel: `${provider}/${modelId}`, modelRuntime: runtime });
+    return !!resolved.model && !resolved.error && await testLiveModel(runtime, resolved.model);
+  } catch { return false; }
 }
 
 async function validateCombo(provider: string, modelId: string, apiKey: string): Promise<{ ok: boolean; error?: string }> {
   if (!API_KEY_PROVIDERS.includes(provider)) return { ok: false, error: "Unsupported provider" };
-  let touchedKey = false;
-  try {
-    if (apiKey) { await modelRuntime.setRuntimeApiKey(provider, apiKey); touchedKey = true; }
-    const r = resolveCliModel({ cliModel: `${provider}/${modelId}`, modelRuntime });
-    if (r.error || !r.model) { if (touchedKey) await restoreProviderKey(provider); return { ok: false, error: r.error ?? "Model not found" }; }
-    const test = modelRuntime.completeSimple(r.model, { messages: [{ role: "user", content: [{ type: "text", text: "Reply with the single word OK." }] }] }, { maxTokens: 8 });
-    // completeSimple does NOT throw on auth/quota failure — it resolves with a
-    // message whose stopReason is "error" (or empty content). Inspect it.
-    const msg = (await Promise.race([test, new Promise((_, rej) => setTimeout(() => rej(new Error("Validation timed out")), 30000))])) as { stopReason?: string; errorMessage?: string; content?: Array<{ type: string; text?: string }> };
-    const text = (msg?.content ?? []).filter((c) => c.type === "text").map((c) => c.text ?? "").join("").trim();
-    if (msg?.stopReason === "error" || !text) {
-      if (touchedKey) await restoreProviderKey(provider);
-      return { ok: false, error: msg?.errorMessage || "The provider rejected the request — check the API key and model." };
-    }
-    return { ok: true };
-  } catch (err) {
-    if (touchedKey) await restoreProviderKey(provider);
-    return { ok: false, error: (err as Error).message };
+  if (typeof modelId !== "string" || !modelId.trim() || modelId.length > 200 || /[\u0000-\u001f\u007f]/.test(modelId)) return { ok: false, error: "Choose a valid model" };
+  if (typeof apiKey !== "string" || apiKey.length > 4096 || /[\u0000-\u001f\u007f]/.test(apiKey)) return { ok: false, error: "Invalid API key input" };
+  const cur = await readAi();
+  const key = apiKey.trim() || (cur.provider === provider ? cur.api_key ?? "" : "");
+  if (!key) {
+    let configured = false;
+    try { configured = modelRuntime.getProviderAuthStatus(provider).configured; } catch { /* reported below */ }
+    if ((provider === "opencode" || provider === "opencode-go") && !configured) return { ok: false, error: "Enter your OpenCode API key" };
+    const resolved = resolveCliModel({ cliModel: `${provider}/${modelId}`, modelRuntime });
+    return resolved.model && !resolved.error && await testLiveModel(modelRuntime, resolved.model)
+      ? { ok: true } : { ok: false, error: "Connection test failed. Check the selected model and credentials." };
   }
+  return await testInIsolatedRuntime(provider, modelId, key)
+    ? { ok: true } : { ok: false, error: "Connection test failed. Check the selected model and credentials." };
 }
 
-async function saveCombo(provider: string, modelId: string, apiKey: string): Promise<{ ok: boolean; error?: string }> {
-  const v = await validateCombo(provider, modelId, apiKey);
-  if (!v.ok) return v;
-  // Persist canonically to Supervisor options under the `ai` group (only overwrite
-  // the key when a new one was entered — blank keeps the existing stored key).
-  const cur = await readAi();
-  const wrote = await writeAddonOptions({ ai: { provider, model: modelId, api_key: apiKey || cur.api_key || "" } });
-  if (!wrote && supervisorToken()) return { ok: false, error: "Could not save to Supervisor options" };
+async function applySelection(provider: string, modelId: string): Promise<void> {
   curProvider = provider; curModel = modelId;
-  const r = resolveCliModel({ cliModel: `${provider}/${modelId}`, modelRuntime });
-  if (!r.error && r.model) model = r.model;
-  // Apply the new model to every active user's session (preserve their conversation
-  // via setModel); create a session for any connected-but-unconfigured slot.
+  const resolved = resolveCliModel({ cliModel: `${provider}/${modelId}`, modelRuntime });
+  if (!resolved.error && resolved.model) model = resolved.model;
   for (const [uid, u] of users) {
     if (u.session && model) { try { await u.session.setModel(model); } catch { /* ignore */ } }
     else { try { await startSessionFor(u, u.sm ?? SessionManager.create(agentCwd, userDir(uid))); } catch { /* ignore */ } }
   }
   broadcastAll({ type: "config_status", data: configStatus() });
+}
+
+async function saveCombo(provider: string, modelId: string, apiKey: string): Promise<{ ok: boolean; error?: string }> {
+  const v = await validateCombo(provider, modelId, apiKey);
+  if (!v.ok) return v;
+  const cur = await readAi();
+  // A blank key only reuses the key for the same provider; switching clears the
+  // legacy singleton instead of assigning one provider's key to another.
+  const savedKey = apiKey.trim() || (cur.provider === provider ? cur.api_key ?? "" : "");
+  const previousOptions = await readAddonOptions();
+  const ai = { provider, model: modelId, ...(savedKey ? { api_key: savedKey } : {}) };
+  const wrote = await writeAddonOptions({ ai });
+  if (!wrote && supervisorToken()) return { ok: false, error: "Could not save provider settings" };
+  if (savedKey) {
+    try { await modelRuntime.setRuntimeApiKey(provider, savedKey); }
+    catch {
+      await writeAddonOptions({ ai: previousOptions.ai ?? {} });
+      return { ok: false, error: "Could not save provider credentials" };
+    }
+  }
+  await applySelection(provider, modelId);
+  return { ok: true };
+}
+
+function validateCustomEndpoint(baseUrl: string, modelId: string, apiKey: string): { baseUrl: string; modelId: string; apiKey: string } | undefined {
+  if (typeof baseUrl !== "string" || baseUrl.length > 2048 || typeof modelId !== "string" || typeof apiKey !== "string" || apiKey.length > 4096) return;
+  const endpoint = baseUrl.trim();
+  const id = modelId.trim();
+  if (!id || id.length > 200 || /[\u0000-\u001f\u007f]/.test(id) || /[\u0000-\u001f\u007f]/.test(apiKey)) return;
+  try {
+    const url = new URL(endpoint);
+    if (!["http:", "https:"].includes(url.protocol) || !url.hostname || url.username || url.password || url.search || url.hash) return;
+    return { baseUrl: url.toString().replace(/\/$/, ""), modelId: id, apiKey: apiKey.trim() };
+  } catch { return; }
+}
+
+function customProviderConfig(baseUrl: string, modelId: string, apiKey: string) {
+  return {
+    name: "Custom OpenAI-compatible endpoint", baseUrl, api: "openai-completions", apiKey: apiKey || NO_AUTH_PLACEHOLDER,
+    models: [{ id: modelId, name: modelId, api: "openai-completions", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 4096 }],
+  };
+}
+
+async function saveCustomEndpoint(baseUrlInput: string, modelInput: string, keyInput: string): Promise<{ ok: boolean; error?: string }> {
+  const input = validateCustomEndpoint(baseUrlInput, modelInput, keyInput);
+  if (!input) return { ok: false, error: "Enter a valid HTTP(S) endpoint and model ID" };
+  let state: ModelsJsonState;
+  try { state = await readModelsJson(); } catch { return { ok: false, error: "Could not read the saved model configuration" }; }
+  const previous = state.providers[CUSTOM_PROVIDER];
+  const sameEndpoint = previous?.baseUrl === input.baseUrl;
+  const effectiveKey = input.apiKey || (sameEndpoint && typeof previous?.apiKey === "string" ? previous.apiKey : NO_AUTH_PLACEHOLDER);
+  const providerConfig = customProviderConfig(input.baseUrl, input.modelId, effectiveKey);
+  if (!await testInIsolatedRuntime(CUSTOM_PROVIDER, input.modelId, "", providerConfig)) {
+    return { ok: false, error: "Connection test failed. Check the endpoint, model ID, and API key." };
+  }
+
+  const providers = { ...state.providers, [CUSTOM_PROVIDER]: providerConfig };
+  try {
+    await writePrivateFile(resolve(engineAgentDir, "models.json"), JSON.stringify({ ...state.config, providers }, null, 2));
+    await modelRuntime.refresh({ providers: [CUSTOM_PROVIDER], allowNetwork: false });
+    const resolved = resolveCliModel({ cliModel: `${CUSTOM_PROVIDER}/${input.modelId}`, modelRuntime });
+    if (resolved.error || !resolved.model) throw new Error("model unavailable");
+  } catch {
+    await restoreModelsJson(state).catch(() => {});
+    await modelRuntime.refresh({ providers: [CUSTOM_PROVIDER], allowNetwork: false }).catch(() => {});
+    return { ok: false, error: "Could not activate the tested endpoint; previous settings were kept" };
+  }
+  const wroteOptions = await writeAddonOptions({ ai: { provider: CUSTOM_PROVIDER, model: input.modelId } });
+  if (!wroteOptions && supervisorToken()) {
+    await restoreModelsJson(state).catch(() => {});
+    await modelRuntime.refresh({ providers: [CUSTOM_PROVIDER], allowNetwork: false }).catch(() => {});
+    return { ok: false, error: "Could not save provider settings; previous settings were kept" };
+  }
+  await applySelection(CUSTOM_PROVIDER, input.modelId);
+  return { ok: true };
+}
+
+function safeAuthUrl(value: string): string | undefined {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || !url.hostname || url.username || url.password) return;
+    url.hash = "";
+    for (const key of [...url.searchParams.keys()]) if (/^(?:access[_-]?token|refresh[_-]?token|auth[_-]?token|token|client[_-]?secret|secret|api[_-]?key|key|authorization[_-]?code|code)$/i.test(key)) url.searchParams.delete(key);
+    return url.toString();
+  } catch { return; }
+}
+
+async function loginCopilot(modelId: string, notify: (event: Record<string, unknown>) => void): Promise<{ ok: boolean; error?: string }> {
+  if (typeof modelId !== "string" || !modelId.trim() || !modelRuntime.getModel("github-copilot", modelId)) return { ok: false, error: "Choose a GitHub Copilot model" };
+  try {
+    const interaction: Parameters<typeof modelRuntime.login>[2] = {
+      prompt: async (prompt) => {
+        // Pi asks for an optional GitHub Enterprise domain; blank selects github.com.
+        if (prompt.type === "text" && prompt.message.startsWith("GitHub Enterprise URL/domain")) return "";
+        throw new Error("Unsupported GitHub Copilot sign-in prompt");
+      },
+      notify(event) {
+        if (event.type === "device_code") {
+          const auth = event as { userCode: string; verificationUri: string; intervalSeconds?: number; expiresInSeconds?: number };
+          const verificationUri = safeAuthUrl(auth.verificationUri);
+          if (verificationUri && auth.userCode.length <= 64) notify({ type: "device_code", userCode: auth.userCode, verificationUri, expiresInSeconds: auth.expiresInSeconds });
+        } else if (event.type === "auth_url") {
+          const auth = event as { url: string };
+          const url = safeAuthUrl(auth.url);
+          if (url) notify({ type: "auth_url", url });
+        } else notify({ type: event.type === "progress" ? "progress" : "info" });
+      },
+    };
+    if (!modelRuntime.getProviderAuthStatus("github-copilot").configured) {
+      await modelRuntime.login("github-copilot", "oauth", interaction);
+    }
+  } catch { return { ok: false, error: "GitHub Copilot sign-in did not complete. Try again." }; }
+  const resolved = resolveCliModel({ cliModel: `github-copilot/${modelId}`, modelRuntime });
+  if (!resolved.model || resolved.error || !await testLiveModel(modelRuntime, resolved.model)) {
+    return { ok: false, error: "GitHub Copilot sign-in worked, but the selected model could not be tested." };
+  }
+  const previousOptions = await readAddonOptions();
+  const wrote = await writeAddonOptions({ ai: { provider: "github-copilot", model: modelId } });
+  if (!wrote && supervisorToken()) { await writeAddonOptions({ ai: previousOptions.ai ?? {} }); return { ok: false, error: "Could not save provider settings" }; }
+  await applySelection("github-copilot", modelId);
   return { ok: true };
 }
 
@@ -579,13 +760,12 @@ async function validateWebsearch(provider: string, key: string): Promise<{ ok: b
     const m = provider === "perplexity_openrouter" ? "perplexity/sonar" : "sonar";
     const r = await fetch(endpoint, { method: "POST", headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" }, body: JSON.stringify({ model: m, messages: [{ role: "user", content: "ping" }], max_tokens: 16 }) });
     if (r.ok) return { ok: true };
-    const t = await r.text().catch(() => "");
-    return { ok: false, error: `HTTP ${r.status} ${t.slice(0, 140)}` };
-  } catch (e) { return { ok: false, error: (e as Error).message }; }
+    return { ok: false, error: `Provider rejected the request (HTTP ${r.status})` };
+  } catch { return { ok: false, error: "Could not reach the search provider" }; }
 }
 async function saveWebsearch(provider: string, key: string): Promise<{ ok: boolean; error?: string }> {
   const cur = await readWebsearch();
-  const finalKey = key || cur.api_key || "";
+  const finalKey = key || (cur.provider === provider ? cur.api_key || "" : "");
   const v = await validateWebsearch(provider, finalKey);
   if (!v.ok) return v;
   const wrote = await writeAddonOptions({ websearch: { enabled: true, provider, api_key: finalKey } });
@@ -605,6 +785,13 @@ async function disableWebsearch(): Promise<void> {
   wsEnabled = false;
   await reloadTools();
   broadcastAll({ type: "websearch_status", data: websearchStatus() });
+}
+
+let configQueue: Promise<unknown> = Promise.resolve();
+function queueConfig<T>(operation: () => Promise<T>): Promise<T> {
+  const result = configQueue.then(operation, operation);
+  configQueue = result.then(() => undefined, () => undefined);
+  return result;
 }
 
 const wss = new WebSocketServer({ server, path: "/ws" });
@@ -632,8 +819,10 @@ wss.on("connection", (ws, req) => {
     return u;
   });
   ws.on("message", (raw) => {
-    let cmd: { type?: string; text?: string; path?: string; provider?: string; model?: string; apiKey?: string };
-    try { cmd = JSON.parse(String(raw)); } catch { return; }
+    const rawText = raw.toString();
+    if (Buffer.byteLength(rawText) > 65536) return;
+    let cmd: { type?: string; text?: string; path?: string; provider?: string; model?: string; modelId?: string; baseUrl?: string; apiKey?: string };
+    try { cmd = JSON.parse(rawText); } catch { return; }
     void ready.then((u) => {
       switch (cmd.type) {
         case "prompt": if (cmd.text) void handlePrompt(u, cmd.text); break;
@@ -642,7 +831,9 @@ wss.on("connection", (ws, req) => {
         case "new_session": void startSessionFor(u, SessionManager.create(agentCwd, userDir(userId))).then(() => broadcastTo(u, { type: "session_cleared" })); break;
         case "open_session": if (cmd.path) void startSessionFor(u, SessionManager.open(cmd.path, userDir(userId))).then(() => broadcastTo(u, { type: "history", data: historyEntries(u) })); break;
         case "list_providers": void listApiKeyProviders().then((p) => sendTo({ type: "providers", data: p })); break;
-        case "save_config": void saveCombo(cmd.provider ?? "", cmd.model ?? "", cmd.apiKey ?? "").then((r) => sendTo({ type: "config_result", data: r })); break;
+        case "save_config": void queueConfig(() => saveCombo(cmd.provider ?? "", cmd.model ?? "", cmd.apiKey ?? "")).then((r) => sendTo({ type: "config_result", data: r }), () => sendTo({ type: "config_result", data: { ok: false, error: "Could not save provider settings" } })); break;
+        case "save_custom_config": void queueConfig(() => saveCustomEndpoint(cmd.baseUrl ?? "", cmd.modelId ?? "", cmd.apiKey ?? "")).then((r) => sendTo({ type: "config_result", data: r }), () => sendTo({ type: "config_result", data: { ok: false, error: "Could not save provider settings" } })); break;
+        case "login_provider": void queueConfig(() => loginCopilot(cmd.model ?? "", (event) => sendTo({ type: "provider_auth_event", data: event }))).then((r) => sendTo({ type: "config_result", data: r }), () => sendTo({ type: "config_result", data: { ok: false, error: "Sign-in did not complete" } })); break;
         case "save_websearch": void saveWebsearch(cmd.provider ?? "", cmd.apiKey ?? "").then((r) => sendTo({ type: "websearch_result", data: r })); break;
         case "disable_websearch": void disableWebsearch(); break;
       }

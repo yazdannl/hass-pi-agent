@@ -17,7 +17,7 @@ RUN apk add --no-cache \
     git \
     libgcc \
     libstdc++ \
-    nodejs \
+    nodejs-current \
     npm \
     python3 \
     fd \
@@ -27,7 +27,9 @@ RUN apk add --no-cache \
     mosquitto-clients
 
 # Install pi coding agent (pinned version)
-RUN npm install -g @earendil-works/pi-coding-agent@0.85.1
+RUN node --version \
+    && node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major < 22 || (major === 22 && minor < 19)) process.exit(1)' \
+    && npm install -g @earendil-works/pi-coding-agent@0.87.1
 
 # Copy HA extension into image
 COPY extensions/home-assistant /opt/ha-extension

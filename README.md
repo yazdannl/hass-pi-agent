@@ -29,20 +29,16 @@ Powered by [Pi](https://github.com/earendil-works/pi), an open-source coding age
 ### 3. Configure in the panel
 
 1. Open **Pi Agent** from the sidebar (or **Open Web UI** on the add-on's Info tab).
-2. The **welcome screen** asks you to choose a provider and model and paste that provider's API key. Pi runs a live test before saving — you can only continue once the key works.
+2. The **welcome screen** asks you to choose a provider and model. Enter an API key, use GitHub Copilot's browser device sign-in, or configure a custom OpenAI-compatible endpoint. Pi tests the connection before saving.
 3. Start chatting. Use the **⚙️ settings** button in the top bar to change the provider, model, or key later.
 
-There are no API-key fields on the add-on's Configuration tab — the panel is the source of truth, and your choice is stored in the add-on options (surviving restarts and updates) under a collapsed, app-managed section.
+There are no API-key fields on the add-on's Configuration tab. Built-in provider selections and API keys are saved in add-on options; Copilot OAuth credentials and custom endpoint settings (including its optional API key) are stored in Pi's private, persistent engine directory. Setup survives restarts and updates.
 
 ## Configuration
 
 ### Provider & model
 
-Set up entirely in the panel. The setup lists the providers that authenticate with a single **API key**, and fetches each provider's model list live from pi:
-
-Anthropic · OpenAI · Google (Gemini) · OpenRouter · xAI (Grok) · Groq · Mistral · Cerebras · Hugging Face
-
-OAuth-only (GitHub Copilot) and multi-credential (Amazon Bedrock, Google Vertex, Azure OpenAI) providers are not offered — the setup is single-API-key only.
+Set up entirely in the panel. The setup lists Pi's single-key providers and their model catalogs, including OpenCode Zen and OpenCode Go. GitHub Copilot uses Pi's native OAuth device sign-in. A **Custom OpenAI-compatible endpoint** option accepts a base URL, model ID, and optional API key and uses Pi's native `models.json` configuration. Other multi-credential providers (such as Amazon Bedrock, Google Vertex, and Azure OpenAI) are not included in this focused flow.
 
 ### Other add-on options
 
