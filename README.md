@@ -1,6 +1,6 @@
 # Pi Agent for Home Assistant
 
-[![Build](https://github.com/dkmaker/hass-pi-agent/actions/workflows/build.yaml/badge.svg)](https://github.com/dkmaker/hass-pi-agent/actions/workflows/build.yaml)
+[![Build](https://github.com/yazdannl/hass-pi-agent/actions/workflows/build.yaml/badge.svg)](https://github.com/yazdannl/hass-pi-agent/actions/workflows/build.yaml)
 
 An AI agent with full access to your Home Assistant — manage automations, entities, dashboards, helpers, and more through a chat panel, in plain language.
 
@@ -15,9 +15,13 @@ Powered by [Pi](https://github.com/earendil-works/pi), an open-source coding age
 3. Click the **⋮** menu (top right) → **Repositories**.
 4. Add this URL:
    ```
-   https://github.com/dkmaker/hass-pi-agent
+   https://github.com/yazdannl/hass-pi-agent
    ```
 5. Click **Add → Close**.
+
+> If you previously added `https://github.com/dkmaker/hass-pi-agent`, remove it and add this fork instead; both repositories define the same add-on slug.
+>
+> The repository uses prebuilt images from this fork's GitHub Container Registry. Before installing after a code change, run **Actions → Build and Publish Add-on** on `main` and make the resulting GHCR packages public.
 
 ### 2. Install and start
 

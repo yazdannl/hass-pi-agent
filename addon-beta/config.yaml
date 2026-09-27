@@ -1,7 +1,7 @@
 name: Pi Agent for Home Assistant (Beta)
 version: 1.1.0-beta.10
 slug: pi_agent_beta
-image: ghcr.io/dkmaker/hass-pi-agent/{arch}-pi_agent_beta
+image: ghcr.io/yazdannl/hass-pi-agent/{arch}-pi_agent_beta
 description: >-
   Beta channel of Pi Agent — pre-release builds for testing new features before
   they ship in the stable add-on. Install alongside the stable add-on.

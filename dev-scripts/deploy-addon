@@ -7,14 +7,15 @@
 #   2. Strip the `image:` line (required for local Dockerfile builds)
 #   3. Reload the add-on store
 #   4. Install (first time) or Rebuild (subsequent) the add-on
-#   5. Start the add-on and show logs
+#   5. Start the add-on; review logs in Home Assistant
 #
 # Usage:
 #   deploy-addon              # Full deploy + rebuild
-#   deploy-addon --logs-only  # Just show recent logs
+#   deploy-addon --logs-only  # Show where to view add-on logs
 #   deploy-addon --restart    # Restart without rebuild (fast, no Docker build)
 #
 set -euo pipefail
+set +x
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -23,9 +24,10 @@ source "$REPO_ROOT/.env"
 ADDON_DIR="$REPO_ROOT/addon"
 ADDON_SLUG="pi_agent"
 SUPERVISOR_SLUG="local_${ADDON_SLUG}"
-export SCRIPT_DIR SUPERVISOR_SLUG
 NET_NAME="${HAOS_NET_NAME:-haos-isolated}"
 TOKEN="${HAOS_API_TOKEN:?HAOS_API_TOKEN not set in .env}"
+unset HAOS_API_TOKEN ANTHROPIC_API_KEY
+export -n TOKEN 2>/dev/null || true
 
 # ── Find VM IP ─────────────────────────────────────────────────
 VM_IP=$(sudo virsh net-dhcp-leases "$NET_NAME" 2>/dev/null | grep -oP '10\.99\.0\.\d+' | head -1)
@@ -40,70 +42,79 @@ SSH_CMD="ssh $SSH_OPTS root@${VM_IP}"
 WS_URL="ws://${VM_IP}:8123/api/websocket"
 
 # ── Supervisor API helper (via WebSocket) ──────────────────────
+# Keep credentials and request data off child-process arguments and output.
 _supervisor_call() {
   local endpoint="$1"
   local method="${2:-get}"
   local data="${3:-}"
 
-  python3 -c "
-import json, asyncio, websockets, sys
+  {
+    printf '%s\n' "$TOKEN"
+    printf '%s\n' "$endpoint"
+    printf '%s\n' "$method"
+    printf '%s' "$data"
+  } | python3 -c '
+import asyncio, json, sys, websockets
+
+ws_url = sys.argv[1]
+token = sys.stdin.readline().rstrip("\n")
+endpoint = sys.stdin.readline().rstrip("\n")
+method = sys.stdin.readline().rstrip("\n")
+data_text = sys.stdin.read()
 
 async def main():
-    async with websockets.connect('${WS_URL}') as ws:
+    async with websockets.connect(ws_url) as ws:
         await ws.recv()
-        await ws.send(json.dumps({'type':'auth','access_token':'${TOKEN}'}))
-        r = json.loads(await ws.recv())
-        if r['type'] != 'auth_ok':
-            print('AUTH_FAILED', file=sys.stderr)
-            sys.exit(1)
-        msg = {'id':1,'type':'supervisor/api','endpoint':'$endpoint','method':'$method'}
-        data_str = '''$data'''
-        if data_str:
-            msg['data'] = json.loads(data_str)
-        await ws.send(json.dumps(msg))
-        r = json.loads(await ws.recv())
-        if r.get('success'):
-            result = r.get('result',{})
-            if isinstance(result, dict) and 'data' in result and len(result) == 1:
-                result = result['data']
-            print(json.dumps(result))
+        await ws.send(json.dumps({"type": "auth", "access_token": token}))
+        auth_reply = json.loads(await ws.recv())
+        if auth_reply.get("type") != "auth_ok":
+            raise RuntimeError()
+        request = {"id": 1, "type": "supervisor/api", "endpoint": endpoint, "method": method}
+        if data_text:
+            request["data"] = json.loads(data_text)
+        await ws.send(json.dumps(request))
+        reply = json.loads(await ws.recv())
+        if not reply.get("success"):
+            raise RuntimeError()
+        result = reply.get("result", {})
+        if isinstance(result, dict) and set(result) == {"data"}:
+            result = result["data"]
+        if endpoint.endswith("/info") and isinstance(result, dict):
+            print(result.get("version", ""))
         else:
-            err = r.get('error',{})
-            print(json.dumps(err), file=sys.stderr)
-            sys.exit(1)
+            print("OK")
 
-asyncio.run(main())
-" 2>&1
+try:
+    asyncio.run(main())
+except Exception:
+    print("Supervisor API call failed", file=sys.stderr)
+    sys.exit(1)
+' "$WS_URL"
 }
 
-# ── Get addon logs via REST (more reliable for text) ───────────
+# ── Avoid printing logs that may contain user data or credentials ─
 _addon_logs() {
-  local lines="${1:-30}"
-  curl -sf -H "Authorization: Bearer ${TOKEN}" \
-    "http://${VM_IP}:8123/api/hassio/addons/${SUPERVISOR_SLUG}/logs" 2>/dev/null \
-    | sed 's/\x1b\[[0-9;]*m//g' | tail -n "$lines"
+  echo "View add-on logs in Home Assistant → Settings → Add-ons → ${SUPERVISOR_SLUG}."
 }
 
 # ── Check if addon is installed ────────────────────────────────
 _is_installed() {
-  local info
-  info=$(_supervisor_call "/addons/${SUPERVISOR_SLUG}/info" 2>/dev/null) || return 1
-  echo "$info" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('version') else 1)" 2>/dev/null
+  local version
+  version=$(_supervisor_call "/addons/${SUPERVISOR_SLUG}/info" 2>/dev/null) || return 1
+  [ -n "$version" ]
 }
 
 # ── Handle flags ───────────────────────────────────────────────
 case "${1:-}" in
   --logs-only)
-    echo "📋 Recent logs for ${SUPERVISOR_SLUG}:"
-    _addon_logs 50
+    _addon_logs
     exit 0
     ;;
   --restart)
     echo "🔄 Restarting ${SUPERVISOR_SLUG} (no rebuild)..."
     _supervisor_call "/addons/${SUPERVISOR_SLUG}/restart" "post" >/dev/null
     sleep 3
-    echo "📋 Logs:"
-    _addon_logs 20
+    _addon_logs
     exit 0
     ;;
 esac
@@ -173,47 +184,15 @@ for i in $(seq 1 60); do
   echo -n "."
 done
 
-# ── Step 7: Inject API keys into add-on config ────────────────
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-  echo "🔑 Injecting ANTHROPIC_API_KEY into add-on options..."
-  # Fetch current options, merge the env var, POST back
-  OPTIONS_JSON=$(python3 << 'PYEOF'
-import json, subprocess, os
-
-info = subprocess.run(
-    [os.environ["SCRIPT_DIR"] + "/ha-supervisor", "addon-info", os.environ["SUPERVISOR_SLUG"]],
-    capture_output=True, text=True
-)
-opts = json.loads(info.stdout).get("options", {})
-
-# Set the dedicated API key field
-opts["anthropic_api_key"] = os.environ["ANTHROPIC_API_KEY"]
-
-print(json.dumps({"options": opts}))
-PYEOF
-  )
-  if _supervisor_call "/addons/${SUPERVISOR_SLUG}/options" "post" "$OPTIONS_JSON" >/dev/null 2>&1; then
-    echo "   ✅ API key configured"
-  else
-    echo "   ⚠️  Failed to set API key (set manually in add-on config)"
-  fi
-else
-  echo "⚠️  ANTHROPIC_API_KEY not in environment — skipping API key injection"
-fi
-
-# ── Step 8: Start and show logs ────────────────────────────────
+# ── Step 7: Start and show where to review logs ───────────────
 echo "▶️  Starting add-on..."
 _supervisor_call "/addons/${SUPERVISOR_SLUG}/start" "post" >/dev/null 2>&1 || true
 sleep 5
 
 echo ""
-echo "📋 Recent logs:"
-echo "─────────────────────────────────────────"
-_addon_logs 25
-echo "─────────────────────────────────────────"
-echo ""
+_addon_logs
 echo "✅ Deploy complete! Add-on: ${SUPERVISOR_SLUG}"
 echo ""
 echo "Commands:"
-echo "  deploy-addon --logs-only   # Check logs"
+echo "  deploy-addon --logs-only   # Show the Home Assistant logs page"
 echo "  deploy-addon --restart     # Quick restart (no rebuild)"
