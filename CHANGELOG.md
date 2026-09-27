@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.2.0](https://github.com/yazdannl/hass-pi-agent/compare/v1.1.0...v1.2.0) (2026-09-27)
+
+
+### Features
+
+* **providers:** add custom and OAuth provider setup ([06b2b4c](https://github.com/yazdannl/hass-pi-agent/commit/06b2b4cbb0ea9b2bb949da79454a9d4721038f5b))
+* **providers:** add custom and OAuth provider setup ([d6888d7](https://github.com/yazdannl/hass-pi-agent/commit/d6888d7fd711add0fb0467b5ae0d60e1d8a2b298))
+
+
+### Bug Fixes
+
+* **addon:** use fork images and support branch builds ([8b2cf01](https://github.com/yazdannl/hass-pi-agent/commit/8b2cf012d5f2d6352f388d117b36597e3f393eaa))
+* **addon:** use fork images and support branch builds ([156532d](https://github.com/yazdannl/hass-pi-agent/commit/156532d381c65549531e6620b8f4fdc81c20adc3))
+
 ## [1.1.0](https://github.com/dkmaker/hass-pi-agent/compare/v1.0.1...v1.1.0) (2026-09-13)
 
 
