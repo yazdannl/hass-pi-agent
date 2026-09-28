@@ -29,6 +29,18 @@ jobs:
     name: Beta tile config in sync
     runs-on: ubuntu-latest
     steps:
+      # A missing tag otherwise surfaces as a bare "git failed with exit code 1"
+      # from actions/checkout.
+      - name: Validate release tag
+        if: inputs.tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --silent; then
+            echo "::error::Tag '${TAG}' does not exist in ${GITHUB_REPOSITORY}. Leave the tag empty to build the selected branch, or use an existing tag such as v1.1.0."
+            exit 1
+          fi
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
